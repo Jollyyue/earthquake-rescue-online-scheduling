@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+"""Section 6.1 one-factor-at-a-time sensitivity analysis.
+
+This file is deliberately an experiment driver, not a second simulator.  It
+loads simulation3.py and calls its generate_scenario/run_algorithm functions so
+that the event engine, road events and repairs, fatigue integration, policies,
+and cumulative weighted rescue-time objective remain identical to Chapter 5.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import csv
+import hashlib
+import importlib.util
+import json
+import math
+import os
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
+
+import numpy as np
+
+
+HERE = Path(__file__).resolve().parent
+DEFAULT_ENGINE = Path(
+    "/Users/yuejingyao/Documents/Codex/2026-09-21/"
+    "referenced-chatgpt-conversation-this-is-an/work/simulation3.py"
+)
+ALGORITHMS = ("Greedy", "Rollout-Time", "Rollout-Benefit")
+ALL_MAIN_ALGORITHMS = ("Greedy", "Rollout-Time", "Rollout-Benefit", "GA", "ACO")
+MASTER_SEED = 20260914
+N_SCENARIOS = 30
+N_SIM = 50
+
+# The old Section 6.1 varied every baseline fatigue rate by +/-10% in 1%
+# increments. A common multiplier preserves the heterogeneous rescue-team
+# baselines (0.05 for teams 1-5 and 0.10 for teams 6-7).
+LAMBDA_MULTIPLIERS = tuple(float(round(float(x), 2)) for x in np.arange(0.90, 1.101, 0.01))
+
+# The old Section 6.1 used alpha=0.2 +/-10%, in 1%-of-baseline increments.
+ALPHA_LEVELS = tuple(float(round(float(x), 3)) for x in np.arange(0.180, 0.2201, 0.002))
+
+
+def load_engine(path: Path):
+    """Load simulation3 under its real import name for spawn multiprocessing.
+
+    macOS uses ``spawn`` for ProcessPoolExecutor workers. Objects sent to those
+    workers are unpickled by importing their defining module, so an artificial
+    name such as ``chapter5_simulation3`` is not importable in the child. Adding
+    the engine directory to sys.path and registering it as ``simulation3`` keeps
+    the imported file identical while making its functions/classes resolvable.
+    """
+    path = path.resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"simulation3.py not found: {path}")
+    engine_dir = str(path.parent)
+    if engine_dir not in sys.path:
+        sys.path.insert(0, engine_dir)
+    spec = importlib.util.spec_from_file_location("simulation3", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot import {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def baseline_p_block(engine) -> float:
+    p01 = engine.daoluduse(0.1, 0.8, 0.2698, 0.0005, 3.3776)
+    return float(np.clip(1000.0 * p01, 0.0, 1.0))
+
+
+def p01_levels(engine) -> Tuple[float, ...]:
+    """Levels for the applied blocked-transition probability called P01 here."""
+    baseline = baseline_p_block(engine)
+    candidates = (0.20, 0.30, 0.35, baseline, 0.45, 0.50, 0.60)
+    return tuple(sorted({round(float(np.clip(x, 0.0, 1.0)), 12) for x in candidates}))
+
+
+def factor_levels(engine) -> Mapping[str, Tuple[float, ...]]:
+    return {
+        "lambda": LAMBDA_MULTIPLIERS,
+        "alpha": ALPHA_LEVELS,
+        "P01": p01_levels(engine),
+    }
+
+
+def apply_lambda_multiplier(scenario, multiplier: float) -> None:
+    """Scale rescue-team lambdas together; do not alter repair-team fatigue."""
+    for team in scenario.rescue_teams:
+        team.fatigue_rate *= multiplier
+
+
+def nominal_people(engine) -> Tuple[List[int], List[int], List[float]]:
+    magnitude = [2] * 11
+    building = [2, 2, 2, 2, 2, 2, 3, 2, 1, 2, 1]
+    population = [3, 1, 2, 1, 1, 1, 3, 2, 1, 2, 1]
+    severity = [5, 5, 5, 3, 3, 1, 3, 1, 1, 1, 1]
+    q_people, h_people = [], []
+    for mag, building_level, population_level in zip(magnitude, building, population):
+        fq, fh = engine.fuzzy_renshu(mag, building_level, population_level)
+        # Exactly the centroid-derived nominal workload used by generate_scenario.
+        q_people.append(int(round(float(np.mean(fq)))))
+        h_people.append(int(round(float(np.mean(fh)))))
+    return q_people, h_people, [float(x) for x in severity]
+
+
+def apply_alpha(engine, scenario, alpha: float) -> None:
+    """Recompute only mutual aid, retaining max(0, exp(-alpha*I)-beta)."""
+    q_people, _, severity = nominal_people(engine)
+    beta = 0.3
+    for i, (q, intensity) in enumerate(zip(q_people, severity), start=1):
+        aid = q * max(0.0, math.exp(-alpha * intensity) - beta)
+        scenario.demand[(i, "Q")] = float(max(0.0, q - aid))
+    # H demand and all weights remain exactly as generated by simulation3.py.
+
+
+def apply_p01(engine, scenario, probability: float) -> None:
+    """Change only the blockage threshold, replaying identical uniform draws.
+
+    simulation3.py draws initial edge uniforms first from np.random.default_rng,
+    then stores the later road-shock uniforms. Replaying those uniforms makes
+    initial and future road states paired across P01 levels without touching the
+    P10/repair logic (the final engine has no stochastic P10 transition).
+    """
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError("P01 applied probability must be in [0,1]")
+    rng = np.random.default_rng(scenario.seed)
+    for u, v in scenario.graph.edges:
+        scenario.graph[u][v]["blocked"] = bool(rng.random() < probability)
+        scenario.graph[u][v]["repair_complete"] = None
+    scenario.p01 = probability / 1000.0
+    scenario.p_block_raw = probability
+    scenario.p_block = probability
+    scenario.p_block_clipped = False
+    for _, draws in scenario.road_shock_draws.items():
+        # Draws themselves are unchanged; simulation3.py applies scenario.p_block.
+        assert all(0.0 <= draw < 1.0 for draw in draws.values())
+
+
+def configure_scenario(engine, base_scenario, factor: str, level: float):
+    scenario = copy.deepcopy(base_scenario)
+    if factor == "lambda":
+        apply_lambda_multiplier(scenario, level)
+    elif factor == "alpha":
+        apply_alpha(engine, scenario, level)
+    elif factor == "P01":
+        apply_p01(engine, scenario, level)
+    else:
+        raise ValueError(f"Unknown factor: {factor}")
+    return scenario
+
+
+def algorithm_seed_map() -> Dict[Tuple[int, str], int]:
+    """Mirror Chapter 5's five-algorithm seed layout, but select only 3 policies."""
+    children = np.random.SeedSequence(MASTER_SEED + 99173).spawn(
+        N_SCENARIOS * len(ALL_MAIN_ALGORITHMS)
+    )
+    result: Dict[Tuple[int, str], int] = {}
+    k = 0
+    for scenario_id in range(1, N_SCENARIOS + 1):
+        for algorithm in ALL_MAIN_ALGORITHMS:
+            seed = int(children[k].generate_state(1)[0])
+            k += 1
+            if algorithm in ALGORITHMS:
+                result[(scenario_id, algorithm)] = seed
+    return result
+
+
+def t_critical_975(df: int) -> float:
+    try:
+        from scipy.stats import t
+        return float(t.ppf(0.975, df))
+    except ImportError:
+        # Full experiment always has n=30 (df=29). This fallback keeps the
+        # published analysis runnable in a minimal environment.
+        if df == 29:
+            return 2.045229642132703
+        raise RuntimeError("scipy is required for non-30-run confidence intervals")
+
+
+def summarize(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    grouped: Dict[Tuple[str, float, str], List[float]] = defaultdict(list)
+    metadata: Dict[Tuple[str, float, str], Dict[str, Any]] = {}
+    for row in rows:
+        key = (row["factor"], float(row["level"]), row["algorithm"])
+        grouped[key].append(float(row["objective"]))
+        metadata[key] = row
+    output = []
+    for key in sorted(grouped, key=lambda x: (x[0], x[1], ALGORITHMS.index(x[2]))):
+        values = np.asarray(grouped[key], dtype=float)
+        n = len(values)
+        sd = float(values.std(ddof=1)) if n > 1 else 0.0
+        se = sd / math.sqrt(n) if n else math.nan
+        half = t_critical_975(n - 1) * se if n > 1 else math.nan
+        factor, level, algorithm = key
+        output.append({
+            "factor": factor,
+            "level": level,
+            "level_unit": metadata[key]["level_unit"],
+            "algorithm": algorithm,
+            "n": n,
+            "mean": float(values.mean()),
+            "median": float(np.median(values)),
+            "sd": sd,
+            "se": se,
+            "ci_method": "two-sided t, 95%, df=n-1",
+            "ci95_lower": float(values.mean() - half),
+            "ci95_upper": float(values.mean() + half),
+            "ci95_half_width": half,
+        })
+    return output
+
+
+def write_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        raise ValueError(f"Refusing to write empty CSV: {path}")
+    fields: List[str] = []
+    for row in rows:
+        for key in row:
+            if key not in fields:
+                fields.append(key)
+    with path.open("w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def make_plots(outdir: Path, summary: Sequence[Dict[str, Any]]) -> None:
+    os.environ.setdefault("MPLCONFIGDIR", str(outdir / ".matplotlib"))
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    colors = {"Greedy": "#4D4D4D", "Rollout-Time": "#2673B8", "Rollout-Benefit": "#D55E00"}
+    labels = {
+        "lambda": "Common multiplier of baseline rescue-team fatigue rates",
+        "alpha": r"Mutual-aid parameter $\alpha$",
+        "P01": r"Road blocked-transition probability $P_{01}$",
+    }
+    filenames = {
+        "lambda": "lambda_sensitivity_95CI.png",
+        "alpha": "alpha_sensitivity_95CI.png",
+        "P01": "P01_sensitivity_95CI.png",
+    }
+    for factor in ("lambda", "alpha", "P01"):
+        fig, ax = plt.subplots(figsize=(7.2, 4.8))
+        for algorithm in ALGORITHMS:
+            data = sorted(
+                (row for row in summary if row["factor"] == factor and row["algorithm"] == algorithm),
+                key=lambda row: float(row["level"]),
+            )
+            x = np.asarray([float(row["level"]) for row in data])
+            y = np.asarray([float(row["mean"]) for row in data])
+            lower = np.asarray([float(row["ci95_lower"]) for row in data])
+            upper = np.asarray([float(row["ci95_upper"]) for row in data])
+            ax.plot(x, y, marker="o", linewidth=1.8, markersize=4, color=colors[algorithm], label=algorithm)
+            ax.fill_between(x, lower, upper, color=colors[algorithm], alpha=0.14, linewidth=0)
+        ax.set_xlabel(labels[factor])
+        ax.set_ylabel("Weighted Total Rescue Time")
+        ax.grid(axis="y", alpha=0.25)
+        ax.legend(frameon=False)
+        fig.tight_layout()
+        fig.savefig(outdir / filenames[factor], dpi=300, bbox_inches="tight")
+        plt.close(fig)
+
+
+def integrity_report(rows: Sequence[Dict[str, Any]], levels: Mapping[str, Sequence[float]],
+                     expected_n: int) -> Dict[str, Any]:
+    expected_seeds = sorted({int(row["environment_seed"]) for row in rows})
+    counts = Counter((row["factor"], float(row["level"]), row["algorithm"]) for row in rows)
+    bad_counts = [
+        {"factor": f, "level": level, "algorithm": alg, "actual": counts[(f, level, alg)], "expected": expected_n}
+        for f, factor_levels_ in levels.items() for level in factor_levels_ for alg in ALGORITHMS
+        if counts[(f, float(level), alg)] != expected_n
+    ]
+    seed_errors = []
+    for factor, factor_levels_ in levels.items():
+        for level in factor_levels_:
+            for algorithm in ALGORITHMS:
+                actual = sorted(int(row["environment_seed"]) for row in rows
+                                if row["factor"] == factor and math.isclose(float(row["level"]), float(level))
+                                and row["algorithm"] == algorithm)
+                if actual != expected_seeds:
+                    seed_errors.append({"factor": factor, "level": level, "algorithm": algorithm})
+    failures = [
+        {"factor": row["factor"], "level": row["level"], "algorithm": row["algorithm"],
+         "scenario_id": row["scenario_id"], "seed": row["environment_seed"],
+         "termination": row["termination"], "unfinished_tasks": row["unfinished_tasks"]}
+        for row in rows if row["termination"] != "completed" or int(row["unfinished_tasks"]) != 0
+    ]
+    invariant_failures = [
+        {"factor": row["factor"], "level": row["level"], "algorithm": row["algorithm"],
+         "scenario_id": row["scenario_id"], "duplicate_service_violations": row["duplicate_service_violations"],
+         "early_open_violations": row["early_open_violations"], "min_remaining_work": row["min_remaining_work"]}
+        for row in rows if int(row["duplicate_service_violations"]) != 0
+        or int(row["early_open_violations"]) != 0 or float(row["min_remaining_work"]) < -1e-7
+    ]
+    return {
+        "passed": not bad_counts and not seed_errors and not failures and not invariant_failures,
+        "rows": len(rows),
+        "expected_rows": sum(len(x) for x in levels.values()) * len(ALGORITHMS) * expected_n,
+        "environment_seed_count": len(expected_seeds),
+        "bad_combination_counts": bad_counts,
+        "seed_pairing_errors": seed_errors,
+        "noncompleted_runs": failures,
+        "state_invariant_failures": invariant_failures,
+    }
+
+
+def write_readme(path: Path, engine_path: Path, engine_hash: str,
+                 levels: Mapping[str, Sequence[float]], environment_seeds: Sequence[int],
+                 total_runs: int, smoke: bool,
+                 planned_levels: Mapping[str, Sequence[float]]) -> None:
+    baseline = {
+        "lambda": "heterogeneous rescue-team rates 0.05 and 0.10; levels are common multipliers",
+        "alpha": 0.2,
+        "P01_applied_probability": min(levels["P01"], key=lambda x: abs(float(x) - 0.4)),
+    }
+    text = f"""SECTION 6.1 OFAT SENSITIVITY ANALYSIS
+
+Status: {'SMOKE TEST (not full results)' if smoke else 'FULL 30-SEED EXPERIMENT'}
+
+Shared model
+------------
+This script imports and calls the final Chapter 5 engine directly:
+{engine_path.resolve()}
+SHA-256: {engine_hash}
+It does not contain an alternative simulation engine. State updates, event handling,
+road shocks and repairs, fatigue integration, Greedy/Rollout policies, and the
+cumulative weighted rescue-time objective all come from simulation3.py.
+
+Baselines
+---------
+{json.dumps(baseline, indent=2)}
+
+Levels
+------
+lambda common multipliers: {list(levels['lambda'])}
+  All rescue-team baseline lambdas are multiplied together, preserving 0.05/0.10
+  heterogeneity. Repair-team lambda=0.15 is not changed.
+alpha: {list(levels['alpha'])}
+  Mutual aid is q*max(0, exp(-alpha*I)-0.3); the non-negative truncation is retained.
+P01 applied probabilities: {list(levels['P01'])}
+  P01 here is the probability actually compared with Bernoulli road draws. The
+  simulation3.py baseline is 1000*daoluduse(...), approximately 0.396. Initial and
+  future road uniforms are held fixed across levels. Repair behavior is unchanged.
+
+Planned full levels (used when running without --smoke):
+lambda common multipliers: {list(planned_levels['lambda'])}
+alpha: {list(planned_levels['alpha'])}
+P01 applied probabilities: {list(planned_levels['P01'])}
+
+Experimental design
+-------------------
+Algorithms: {list(ALGORITHMS)}
+Environment seeds ({len(environment_seeds)}): {list(environment_seeds)}
+Algorithm seeds are deterministic, distinct from environment seeds, and identical
+for the corresponding scenario/algorithm across every factor and level.
+Runs represented here: {total_runs}
+Planned full runs: {sum(len(x) for x in planned_levels.values()) * len(ALGORITHMS) * N_SCENARIOS}
+Rollout futures per candidate (full default): {N_SIM}
+All non-varied parameters retain simulation3.py baselines. Affected populations are
+centroid-derived nominal workloads; no fuzzy population values are randomly sampled.
+
+Statistics and files
+--------------------
+sensitivity_summary.csv reports n, mean, median, sample SD, SE, and a two-sided
+95% Student-t confidence interval for the mean (df=n-1). Plots show mean and the
+same 95% CI. raw_sensitivity_results.csv retains every objective and completion,
+termination, runtime, road-probability, and state-integrity field.
+
+How to run
+----------
+Full analysis:
+  python sensitivity_analysis.py
+
+Small validation run (separate sensitivity_smoke/ directory):
+  python sensitivity_analysis.py --smoke
+
+Optional engine path:
+  python sensitivity_analysis.py --simulation3 /absolute/path/to/simulation3.py
+"""
+    path.write_text(text, encoding="utf-8")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--simulation3", type=Path, default=DEFAULT_ENGINE)
+    parser.add_argument("--output-dir", type=Path, default=HERE)
+    parser.add_argument("--n-sim", type=int, default=N_SIM)
+    parser.add_argument("--smoke", action="store_true",
+                        help="Use 2 seeds, the baseline level of each factor, and n_sim=2")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    engine = load_engine(args.simulation3)
+    full_levels = factor_levels(engine)
+    baseline = baseline_p_block(engine)
+    if args.smoke:
+        levels: Mapping[str, Tuple[float, ...]] = {
+            "lambda": (1.0,), "alpha": (0.2,), "P01": (round(baseline, 12),)
+        }
+        # Two rollout futures deliberately exercise the spawn process pool used
+        # by the full N_sim=50 analysis on macOS.
+        n_scenarios, n_sim = 2, 2
+        outdir = args.output_dir / "sensitivity_smoke"
+    else:
+        levels = full_levels
+        n_scenarios, n_sim = N_SCENARIOS, args.n_sim
+        outdir = args.output_dir
+
+    base_scenarios = engine.make_scenarios(N_SCENARIOS, MASTER_SEED)[:n_scenarios]
+    seeds = algorithm_seed_map()
+    rows: List[Dict[str, Any]] = []
+    for factor in ("lambda", "alpha", "P01"):
+        for level in levels[factor]:
+            for base in base_scenarios:
+                for algorithm in ALGORITHMS:
+                    scenario = configure_scenario(engine, base, factor, float(level))
+                    algorithm_seed = seeds[(scenario.scenario_id, algorithm)]
+                    print(f"factor={factor:6s} level={level:.12g} scenario={scenario.scenario_id:02d} "
+                          f"algorithm={algorithm:15s} starting...", flush=True)
+                    result, _ = engine.run_algorithm(
+                        scenario, algorithm, algorithm_seed, n_sim=n_sim, search_budget=60
+                    )
+                    row = {
+                        "factor": factor,
+                        "level": float(level),
+                        "level_unit": "baseline multiplier" if factor == "lambda" else
+                                      ("alpha" if factor == "alpha" else "applied probability"),
+                        "environment_seed": scenario.seed,
+                        **result,
+                    }
+                    rows.append(row)
+                    print(f"  objective={result['objective']:.6f} termination={result['termination']}", flush=True)
+
+    summary = summarize(rows)
+    outdir.mkdir(parents=True, exist_ok=True)
+    write_csv(outdir / "raw_sensitivity_results.csv", rows)
+    write_csv(outdir / "sensitivity_summary.csv", summary)
+    make_plots(outdir, summary)
+    report = integrity_report(rows, levels, n_scenarios)
+    with (outdir / "sensitivity_integrity_report.json").open("w", encoding="utf-8") as stream:
+        json.dump(report, stream, indent=2)
+    environment_seeds = [scenario.seed for scenario in base_scenarios]
+    write_readme(
+        outdir / "sensitivity_analysis_README.txt", args.simulation3, sha256(args.simulation3),
+        levels, environment_seeds, len(rows), args.smoke, full_levels,
+    )
+    if args.smoke:
+        # Keep the requested top-level documentation visible while placing all
+        # provisional smoke outputs in a clearly labelled subdirectory.
+        write_readme(
+            args.output_dir / "sensitivity_analysis_README.txt", args.simulation3,
+            sha256(args.simulation3), levels, environment_seeds, len(rows), True, full_levels,
+        )
+    if not report["passed"]:
+        raise RuntimeError(f"Integrity checks failed; inspect {outdir / 'sensitivity_integrity_report.json'}")
+    print(f"Wrote {len(rows)} results; all integrity checks passed: {outdir.resolve()}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
